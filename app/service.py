@@ -138,6 +138,20 @@ POST /namespaces/{namespace}/names/allocate）：
 4. 无解抛 AllocationImpossibleError（-> 409），items 列出全部申请项的逐
    候选阻断原因（mixed_script / existing_conflict / request_conflict /
    group_infeasible）；任何失败整体回滚，绝不写入部分结果
+
+显示名变更流水（list_name_events，GET /name-events）：
+1. name_events 由数据库迁移创建的 display_names AFTER INSERT/UPDATE/DELETE
+   触发器写入：注册 / 批量 / 候选集注册与预占确认记 insert，改名 / 交换 /
+   命名空间合并记 update，释放记 delete；事件与业务变更同属一个事务，
+   回滚（冲突 / 版本过期 / 锁竞争等任何失败路径）不会留下事件
+2. 每条事件保存事件号（自增主键）、UTC 时刻、动作与变更前后的 id /
+   namespace / original_name / normalized_name / revision 快照（insert 无
+   before、delete 无 after）；交换的三步 UPDATE 如实记为三条 update 事件
+   （中间态为随机临时名），合并对每条迁移记录记一条 before/after 命名空间
+   不同的 update 事件
+3. 查询按事件号升序分页：namespace 过滤匹配变更前或后空间（合并事件同时
+   属于源与目标），after_id 为排他游标，limit 1–100，响应附 next_cursor；
+   建表迁移前的存量数据不补造历史事件
 """
 from __future__ import annotations
 
@@ -2453,4 +2467,85 @@ def allocate_names(
             }
             for i, candidate_index in enumerate(solution)
         ],
+    }
+
+
+# ---------- 显示名变更流水（GET /name-events） ----------
+
+
+def _name_event_state(row: sqlite3.Row, prefix: str) -> dict | None:
+    """从流水行提取变更前（before_*）/ 变更后（after_*）快照。
+
+    insert 事件 before_* 全为 NULL、delete 事件 after_* 全为 NULL，此时
+    对应快照返回 None；事件触发器保证两侧至多一侧为空。
+    """
+    if row[f"{prefix}_id"] is None:
+        return None
+    return {
+        "id": row[f"{prefix}_id"],
+        "namespace": row[f"{prefix}_namespace"],
+        "original_name": row[f"{prefix}_original_name"],
+        "normalized_name": row[f"{prefix}_normalized_name"],
+        "revision": row[f"{prefix}_revision"],
+    }
+
+
+def _name_event_payload(row: sqlite3.Row) -> dict:
+    """把 name_events 行组装为接口事件载荷（before / after 嵌套快照）。"""
+    return {
+        "id": row["id"],
+        "occurred_at": row["occurred_at"],
+        "action": row["action"],
+        "before": _name_event_state(row, "before"),
+        "after": _name_event_state(row, "after"),
+    }
+
+
+def list_name_events(
+    conn: sqlite3.Connection,
+    namespace: str | None = None,
+    after_id: int = 0,
+    limit: int = 100,
+) -> dict:
+    """按事件号升序分页读取显示名变更流水（只读）。
+
+    - namespace 非空时匹配**变更前或变更后**的命名空间：合并产生的 update
+      事件 before_namespace 为源、after_namespace 为目标，故以源或目标空间
+      过滤都能取到；不传则跨全部命名空间。
+    - after_id 为**排他游标**：只返回事件号严格大于它的事件（0 / 缺省表示
+      从头开始），事件号即 AUTOINCREMENT 主键，按其升序即提交顺序。
+    - 取 limit + 1 条判断是否还有后续页：第 limit+1 条存在则 next_cursor
+      为本页最后一条事件号，否则为 None。游标只增不减，可安全顺翻。
+
+    事件全部由 display_names 的 AFTER 触发器在业务同事务内追加，故本函数
+    只做只读查询；建表迁移完成前的存量数据没有历史事件（不补造）。
+    """
+    if namespace is None:
+        rows = conn.execute(
+            """
+            SELECT * FROM name_events
+             WHERE id > ?
+             ORDER BY id
+             LIMIT ?
+            """,
+            (after_id, limit + 1),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT * FROM name_events
+             WHERE id > ?
+               AND (before_namespace = ? OR after_namespace = ?)
+             ORDER BY id
+             LIMIT ?
+            """,
+            (after_id, namespace, namespace, limit + 1),
+        ).fetchall()
+
+    page = rows[:limit]
+    events = [_name_event_payload(row) for row in page]
+    has_more = len(rows) > limit
+    return {
+        "events": events,
+        "next_cursor": events[-1]["id"] if has_more else None,
     }

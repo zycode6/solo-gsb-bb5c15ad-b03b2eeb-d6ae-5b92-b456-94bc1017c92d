@@ -4280,7 +4280,7 @@ def test_migrate_legacy_takeover_establishes_baseline(tmp_path):
 
     applied = database.migrate(str(legacy_path))
     # display_names 已存在（v1 基线），其余迁移按序补齐
-    assert applied == [2, 3, 4, 5]
+    assert applied == [2, 3, 4, 5, 6]
     assert 1 not in applied
 
     import sqlite3
@@ -4292,7 +4292,7 @@ def test_migrate_legacy_takeover_establishes_baseline(tmp_path):
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        assert versions == [1, 2, 3, 4, 5]
+        assert versions == [1, 2, 3, 4, 5, 6]
         # 既有数据无损，revision 回填为 1
         assert conn.execute(
             "SELECT id, revision FROM display_names"
@@ -4371,7 +4371,7 @@ def test_migration_status_is_read_only_and_reports_issues(tmp_path):
     # 既有库未迁移：全部待应用，且不创建 schema_migrations（只读）
     status = database.migration_status(str(db_path))
     assert status["applied"] == []
-    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5, 6]
     assert status["issues"] == []
 
     import sqlite3
@@ -4388,7 +4388,7 @@ def test_migration_status_is_read_only_and_reports_issues(tmp_path):
     # 迁移后：全部已应用、无待应用、无异常
     database.migrate(str(db_path))
     status = database.migration_status(str(db_path))
-    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5, 6]
     assert status["pending"] == []
     assert status["issues"] == []
 
@@ -4414,7 +4414,7 @@ def test_migration_status_on_missing_database_reports_all_pending(tmp_path):
     db_path = tmp_path / "missing.db"
     status = database.migration_status(str(db_path))
     assert status["applied"] == []
-    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5, 6]
     assert status["issues"] == []
     assert not db_path.exists()
 
@@ -4431,7 +4431,7 @@ def test_concurrent_migrate_applies_each_version_once(tmp_path):
 
     # 每个版本在全部进程中至多被执行一次
     applied = [version for result in results for version in result]
-    assert sorted(applied) == [2, 3, 4, 5]
+    assert sorted(applied) == [2, 3, 4, 5, 6]
 
     import sqlite3
 
@@ -4439,7 +4439,7 @@ def test_concurrent_migrate_applies_each_version_once(tmp_path):
         rows = conn.execute(
             "SELECT version, COUNT(*) FROM schema_migrations GROUP BY version"
         ).fetchall()
-        assert rows == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+        assert rows == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
         assert conn.execute(
             "SELECT revision FROM display_names WHERE id = 1"
         ).fetchone() == (1,)
@@ -4451,14 +4451,14 @@ def test_database_cli_migrate_and_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(database, "DATABASE_PATH", str(db_path))
 
     assert database.main(["migrate"]) == 0
-    assert "applied versions: [1, 2, 3, 4, 5]" in capsys.readouterr().out
+    assert "applied versions: [1, 2, 3, 4, 5, 6]" in capsys.readouterr().out
     # 幂等：再次执行无待应用迁移
     assert database.main(["migrate"]) == 0
     assert "up to date" in capsys.readouterr().out
 
     assert database.main(["status"]) == 0
     status = json.loads(capsys.readouterr().out)
-    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5, 6]
     assert status["pending"] == []
     assert status["issues"] == []
 
@@ -4472,3 +4472,345 @@ def test_database_cli_migrate_and_status(tmp_path, monkeypatch, capsys):
         conn.commit()
     assert database.main(["migrate"]) == 1
     assert "2" in capsys.readouterr().err
+
+
+# ---------- 显示名变更流水 GET /name-events ----------
+
+
+def name_events(client, **params):
+    return client.get("/name-events", params=params)
+
+
+def test_name_events_empty_database_returns_empty_page(client):
+    body = name_events(client).json()
+    assert body == {"events": [], "next_cursor": None}
+
+
+def test_name_events_register_records_insert_event_with_after_state(client):
+    created = register(client, "Alice").json()
+
+    body = name_events(client).json()
+    assert body["next_cursor"] is None
+    assert len(body["events"]) == 1
+    event = body["events"][0]
+    assert event["id"] == 1
+    assert event["occurred_at"].endswith("Z")  # UTC ISO 8601
+    assert event["action"] == "insert"
+    assert event["before"] is None
+    assert event["after"] == {
+        "id": created["id"],
+        "namespace": "chat",
+        "original_name": "Alice",
+        "normalized_name": "alice",
+        "revision": 1,
+    }
+
+
+def test_name_events_claim_records_insert_event_but_reservation_does_not(client):
+    # 预占写的是 name_reservations，不产生 display_names 事件
+    reserved = reserve(client, "paypal")
+    assert reserved.status_code == 201
+    assert name_events(client).json()["events"] == []
+
+    token = reserved.json()["token"]
+    assert claim(client, token).status_code == 201
+
+    events = name_events(client).json()["events"]
+    assert len(events) == 1
+    assert events[0]["action"] == "insert"
+    assert events[0]["before"] is None
+    assert events[0]["after"]["original_name"] == "paypal"
+    assert events[0]["after"]["revision"] == 1
+
+
+def test_name_events_batch_register_records_one_event_per_name_in_one_txn(client):
+    resp = client.post(
+        "/namespaces/chat/names/batch", json={"names": ["alice", "bob", "carol"]}
+    )
+    assert resp.status_code == 201
+
+    events = name_events(client).json()["events"]
+    assert [e["action"] for e in events] == ["insert", "insert", "insert"]
+    assert [e["after"]["original_name"] for e in events] == [
+        "alice",
+        "bob",
+        "carol",
+    ]
+    assert all(e["before"] is None for e in events)
+
+
+def test_name_events_rename_records_update_event_with_before_and_after(client):
+    created = register(client, "Alice").json()
+
+    resp = client.patch(
+        f"/namespaces/chat/names/{created['id']}",
+        json={"name": "Alicia", "expected_revision": 1},
+    )
+    assert resp.status_code == 200
+
+    events = name_events(client).json()["events"]
+    assert [e["action"] for e in events] == ["insert", "update"]
+    event = events[-1]
+    assert event["before"] == {
+        "id": created["id"],
+        "namespace": "chat",
+        "original_name": "Alice",
+        "normalized_name": "alice",
+        "revision": 1,
+    }
+    assert event["after"] == {
+        "id": created["id"],
+        "namespace": "chat",
+        "original_name": "Alicia",
+        "normalized_name": "alicia",
+        "revision": 2,
+    }
+
+
+def test_name_events_swap_records_three_step_update_events(client):
+    alice = register(client, "alice").json()
+    bob = register(client, "bob").json()
+
+    resp = swap(
+        client,
+        {"id": alice["id"], "expected_revision": 1},
+        {"id": bob["id"], "expected_revision": 1},
+    )
+    assert resp.status_code == 200
+
+    events = name_events(client).json()["events"]
+    assert [e["action"] for e in events] == [
+        "insert",
+        "insert",
+        "update",
+        "update",
+        "update",
+    ]
+    temp_first, take_over, temp_last = events[2], events[3], events[4]
+
+    # 第 1 步：left 改成随机临时名腾出唯一槽位（不递增 revision）
+    assert temp_first["before"]["original_name"] == "alice"
+    assert temp_first["after"]["original_name"].startswith("__swap__/")
+    assert temp_first["before"]["revision"] == 1
+    assert temp_first["after"]["revision"] == 1
+
+    # 第 2 步：right 接管 left 的名称，revision 1 -> 2
+    assert take_over["before"] == {
+        "id": bob["id"],
+        "namespace": "chat",
+        "original_name": "bob",
+        "normalized_name": "bob",
+        "revision": 1,
+    }
+    assert take_over["after"] == {
+        "id": bob["id"],
+        "namespace": "chat",
+        "original_name": "alice",
+        "normalized_name": "alice",
+        "revision": 2,
+    }
+
+    # 第 3 步：left（临时名）接管 right 的名称，revision 1 -> 2
+    temp_name = temp_first["after"]["original_name"]
+    assert temp_last["before"]["original_name"] == temp_name
+    assert temp_last["after"] == {
+        "id": alice["id"],
+        "namespace": "chat",
+        "original_name": "bob",
+        "normalized_name": "bob",
+        "revision": 2,
+    }
+
+
+def test_name_events_merge_records_namespace_change_and_filter_matches_both(client):
+    first = register(client, "alice", namespace="a").json()
+    second = register(client, "bob", namespace="a").json()
+
+    resp = merge(client, source="a", target="b")
+    assert resp.status_code == 200
+
+    events = name_events(client).json()["events"]
+    updates = sorted(
+        (e for e in events if e["action"] == "update"),
+        key=lambda e: e["before"]["id"],
+    )
+    assert len(updates) == 2  # 每条迁移记录一条命名空间变更事件
+    for event, record_id in zip(updates, [first["id"], second["id"]], strict=True):
+        assert event["before"]["namespace"] == "a"
+        assert event["after"]["namespace"] == "b"
+        assert event["before"]["id"] == event["after"]["id"] == record_id
+        assert event["before"]["revision"] == event["after"]["revision"] == 1
+
+    # 按源空间过滤：注册事件（after=a）+ 合并事件（before=a）共 4 条
+    source_events = name_events(client, namespace="a").json()["events"]
+    assert len(source_events) == 4
+    for event in source_events:
+        if event["action"] == "insert":
+            assert event["before"] is None
+            assert event["after"]["namespace"] == "a"
+        else:
+            assert event["before"]["namespace"] == "a"
+            assert event["after"]["namespace"] == "b"
+
+    # 按目标空间过滤：只命中合并事件（after=b），事件号与源空间看到的一致
+    target_events = name_events(client, namespace="b").json()["events"]
+    assert [e["id"] for e in target_events] == [e["id"] for e in updates]
+    assert all(e["after"]["namespace"] == "b" for e in target_events)
+
+
+def test_name_events_release_records_delete_event_with_before_state(client):
+    created = register(client, "alice").json()
+
+    resp = release(client, created["id"], expected_revision=1, cooldown_seconds=3600)
+    assert resp.status_code == 200
+
+    events = name_events(client).json()["events"]
+    assert [e["action"] for e in events] == ["insert", "delete"]
+    event = events[-1]
+    assert event["before"] == {
+        "id": created["id"],
+        "namespace": "chat",
+        "original_name": "alice",
+        "normalized_name": "alice",
+        "revision": 1,
+    }
+    assert event["after"] is None
+
+
+def test_name_events_rolled_back_transactions_leave_no_events(client):
+    assert register(client, "alice").status_code == 201
+    assert register(client, "bob").status_code == 201
+
+    # 冲突注册：写事务复查失败整体回滚
+    assert register(client, "ALICE").status_code == 409
+    # 混脚本：只读分析拒绝（未写库）
+    assert register(client, MIXED_ADMIN).status_code == 422
+    # 版本过期的改名 / 释放 / 交换：写事务回滚
+    assert client.patch(
+        "/namespaces/chat/names/1",
+        json={"name": "xavier", "expected_revision": 99},
+    ).status_code == 409
+    assert client.request(
+        "DELETE",
+        "/namespaces/chat/names/1",
+        json={"expected_revision": 99, "cooldown_seconds": 60},
+    ).status_code == 409
+    assert swap(
+        client,
+        {"id": 1, "expected_revision": 99},
+        {"id": 2, "expected_revision": 1},
+    ).status_code == 409
+    # 批量校验失败：不落库
+    assert client.post(
+        "/namespaces/chat/names/batch", json={"names": ["app", CYRILLIC_APP]}
+    ).status_code == 422
+    # 预占冲突：预占本身回滚，不留任何 display_names 事件
+    assert reserve(client, "alice").status_code == 409
+
+    events = name_events(client).json()["events"]
+    assert [e["action"] for e in events] == ["insert", "insert"]
+
+
+def test_name_events_pagination_uses_exclusive_cursor_and_ascending_ids(client):
+    for index in range(5):
+        assert register(client, f"user{index}").status_code == 201
+
+    page1 = name_events(client, limit=2).json()
+    assert [e["id"] for e in page1["events"]] == [1, 2]
+    assert page1["next_cursor"] == 2
+
+    page2 = name_events(client, limit=2, after_id=page1["next_cursor"]).json()
+    assert [e["id"] for e in page2["events"]] == [3, 4]
+    assert page2["next_cursor"] == 4
+
+    # 末页不足一页：next_cursor 为 None
+    page3 = name_events(client, limit=2, after_id=page2["next_cursor"]).json()
+    assert [e["id"] for e in page3["events"]] == [5]
+    assert page3["next_cursor"] is None
+
+    # 再翻一页：空结果且游标终止
+    page4 = name_events(client, limit=2, after_id=5).json()
+    assert page4 == {"events": [], "next_cursor": None}
+
+    # 整页恰好取完（无第 limit+1 条）时 next_cursor 同样为 None
+    page_all = name_events(client, limit=5).json()
+    assert [e["id"] for e in page_all["events"]] == [1, 2, 3, 4, 5]
+    assert page_all["next_cursor"] is None
+
+
+def test_name_events_limit_and_cursor_validation(client):
+    assert name_events(client, limit=0).status_code == 422
+    assert name_events(client, limit=101).status_code == 422
+    assert name_events(client, after_id=-1).status_code == 422
+    assert name_events(client, after_id="x").status_code == 422
+    # 边界合法
+    assert name_events(client, limit=1).status_code == 200
+    assert name_events(client, limit=100).status_code == 200
+    assert name_events(client, after_id=0).status_code == 200
+
+
+def test_name_events_namespace_filter_returns_only_matching_events(client):
+    register(client, "alice", namespace="a")
+    register(client, "bob", namespace="b")
+    register(client, "carol", namespace="a")
+
+    events_a = name_events(client, namespace="a").json()["events"]
+    assert [e["after"]["original_name"] for e in events_a] == ["alice", "carol"]
+    events_b = name_events(client, namespace="b").json()["events"]
+    assert [e["after"]["original_name"] for e in events_b] == ["bob"]
+    # 游标与命名空间过滤可组合
+    paged = name_events(client, namespace="a", after_id=events_a[0]["id"]).json()
+    assert [e["after"]["original_name"] for e in paged["events"]] == ["carol"]
+    assert paged["next_cursor"] is None
+    # 未知命名空间：空页
+    assert name_events(client, namespace="nope").json() == {
+        "events": [],
+        "next_cursor": None,
+    }
+
+
+def test_openapi_documents_name_events_endpoint(client):
+    operation = client.get("/openapi.json").json()["paths"]["/name-events"]["get"]
+    assert "200" in operation["responses"]
+    assert "422" in operation["responses"]
+    params = {p["name"]: p for p in operation["parameters"]}
+    assert params["after_id"]["in"] == "query"
+    assert params["limit"]["in"] == "query"
+    assert params["namespace"]["in"] == "query"
+
+
+def test_migrate_does_not_backfill_name_events_for_existing_data(tmp_path):
+    """存量数据不补造旧事件：接管老库后流水为空；迁移后的新写入才入账。"""
+    db_path = tmp_path / "legacy-events.db"
+    _legacy_db_without_revision(db_path)  # 已含一条 Alice 记录（无流水）
+
+    database.migrate(str(db_path))
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        # 存量 Alice 记录没有任何历史事件
+        assert conn.execute("SELECT COUNT(*) FROM name_events").fetchone() == (0,)
+        # 三个审计触发器已就位
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='trigger'"
+            )
+        }
+        assert triggers == {
+            "trg_display_names_events_insert",
+            "trg_display_names_events_update",
+            "trg_display_names_events_delete",
+        }
+        # 迁移后的新写入由触发器如实记录（存量仍不补）
+        conn.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'Bob', 'bob')"
+        )
+        conn.commit()
+        rows = conn.execute(
+            "SELECT action, after_original_name, before_original_name "
+            "FROM name_events"
+        ).fetchall()
+        assert rows == [("insert", "Bob", None)]

@@ -633,3 +633,51 @@ class NameAllocateResponse(BaseModel):
 class ErrorDetail(BaseModel):
     error: str
     message: str
+
+
+# ---------- 显示名变更流水 GET /name-events ----------
+
+# 变更流水分页：limit 允许的范围（1–100）与默认页大小
+MIN_NAME_EVENTS_LIMIT = 1
+MAX_NAME_EVENTS_LIMIT = 100
+DEFAULT_NAME_EVENTS_LIMIT = 100
+
+
+class NameEventState(BaseModel):
+    """变更前 / 后的名称记录快照（字段集合与 display_names 行一致）。"""
+
+    id: int
+    namespace: str
+    original_name: str
+    normalized_name: str
+    revision: int = Field(description="该次变更时的乐观锁版本（插入为 1，改名 / 交换 / 合并迁移后递增）")
+
+
+class NameEvent(BaseModel):
+    """一条显示名变更流水事件：由 display_names 审计触发器在业务同事务内写入。"""
+
+    id: int = Field(description="事件号：全表单调递增，GET /name-events 以它做排他游标")
+    occurred_at: str = Field(description="事件发生时刻（UTC ISO 8601，毫秒精度，Z 后缀）")
+    action: Literal["insert", "update", "delete"] = Field(
+        description=(
+            "变更动作：insert（注册 / 预占确认）、update（改名 / 交换 / 命名空间合并）、"
+            "delete（释放）"
+        )
+    )
+    before: NameEventState | None = Field(
+        description="变更前快照；insert 事件为 null"
+    )
+    after: NameEventState | None = Field(
+        description="变更后快照；delete 事件为 null"
+    )
+
+
+class NameEventsPage(BaseModel):
+    """变更流水分页响应：按事件号升序的一页事件与下一页排他游标。"""
+
+    events: list[NameEvent] = Field(description="本页事件，按事件号升序排列")
+    next_cursor: int | None = Field(
+        description=(
+            "下一页的排他游标（作为 after_id 传入）；已到流水末尾、没有更多事件时为 null"
+        )
+    )
