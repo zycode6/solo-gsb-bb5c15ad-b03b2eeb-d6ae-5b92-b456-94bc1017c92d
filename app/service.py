@@ -138,6 +138,19 @@ POST /namespaces/{namespace}/names/allocate）：
 4. 无解抛 AllocationImpossibleError（-> 409），items 列出全部申请项的逐
    候选阻断原因（mixed_script / existing_conflict / request_conflict /
    group_infeasible）；任何失败整体回滚，绝不写入部分结果
+
+显示名变更流水（list_name_events，GET /name-events）：
+1. name_events 表只由 display_names 上的 INSERT / UPDATE / DELETE 审计
+   触发器写入（迁移 v6 建立），与触发语句同属一个事务：注册、预占确认、
+   改名、交换（含事务内临时名的中间步骤）、命名空间合并与释放的全部行
+   变更逐次记录；业务回滚时事件一并回滚，绝不留下孤儿事件
+2. 每条事件保存事件号（自增 id）、UTC 时刻、动作与变更前后两侧的
+   id / namespace / original_name / normalized_name / revision
+   （insert 无 old_*，delete 无 new_*）；存量数据不补造历史事件
+3. 查询按事件号升序分页：after_id 为排他游标（只返回 id > after_id），
+   limit 1–100；namespace 过滤匹配变更前**或**变更后的命名空间（合并
+   迁出 / 迁入两侧都可见）；多取一条探测是否还有后续，据此给出
+   next_cursor（本页最后一条事件号）或 None
 """
 from __future__ import annotations
 
@@ -2454,3 +2467,42 @@ def allocate_names(
             for i, candidate_index in enumerate(solution)
         ],
     }
+
+
+# ---------- 显示名变更流水（GET /name-events） ----------
+
+# 单页事件数上限（与接口 limit 参数的上限一致）
+MAX_NAME_EVENTS_LIMIT = 100
+
+
+def list_name_events(
+    conn: sqlite3.Connection,
+    namespace: str | None = None,
+    after_id: int = 0,
+    limit: int = MAX_NAME_EVENTS_LIMIT,
+) -> dict:
+    """按事件号升序分页读取显示名变更流水（只读，不清理任何数据）。
+
+    事件由 display_names 的审计触发器在业务事务内写入（注册 / 预占确认 /
+    改名 / 交换 / 合并 / 释放），本函数只查询不修改。
+
+    - namespace：只返回变更前（old_namespace）或变更后（new_namespace）
+      属于该空间的事件——合并迁出源空间、迁入目标空间的 update 事件在两侧
+      都能查到；
+    - after_id：排他游标，只返回事件号大于它的事件；
+    - limit：单页上限 1–100。多取一条探测是否还有后续事件：有则
+      next_cursor 为本页最后一条事件号（作为下一次的 after_id），
+      否则 next_cursor 为 None。
+    """
+    sql = "SELECT * FROM name_events WHERE id > ?"
+    params: list = [after_id]
+    if namespace is not None:
+        sql += " AND (old_namespace = ? OR new_namespace = ?)"
+        params.extend((namespace, namespace))
+    sql += " ORDER BY id LIMIT ?"
+    params.append(limit + 1)  # 多取一条用于探测是否还有下一页
+    rows = conn.execute(sql, params).fetchall()
+
+    events = [dict(row) for row in rows[:limit]]
+    next_cursor = events[-1]["id"] if len(rows) > limit else None
+    return {"events": events, "next_cursor": next_cursor}

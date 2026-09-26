@@ -4280,7 +4280,7 @@ def test_migrate_legacy_takeover_establishes_baseline(tmp_path):
 
     applied = database.migrate(str(legacy_path))
     # display_names 已存在（v1 基线），其余迁移按序补齐
-    assert applied == [2, 3, 4, 5]
+    assert applied == [2, 3, 4, 5, 6]
     assert 1 not in applied
 
     import sqlite3
@@ -4292,7 +4292,7 @@ def test_migrate_legacy_takeover_establishes_baseline(tmp_path):
                 "SELECT version FROM schema_migrations ORDER BY version"
             )
         ]
-        assert versions == [1, 2, 3, 4, 5]
+        assert versions == [1, 2, 3, 4, 5, 6]
         # 既有数据无损，revision 回填为 1
         assert conn.execute(
             "SELECT id, revision FROM display_names"
@@ -4371,7 +4371,7 @@ def test_migration_status_is_read_only_and_reports_issues(tmp_path):
     # 既有库未迁移：全部待应用，且不创建 schema_migrations（只读）
     status = database.migration_status(str(db_path))
     assert status["applied"] == []
-    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5, 6]
     assert status["issues"] == []
 
     import sqlite3
@@ -4388,7 +4388,7 @@ def test_migration_status_is_read_only_and_reports_issues(tmp_path):
     # 迁移后：全部已应用、无待应用、无异常
     database.migrate(str(db_path))
     status = database.migration_status(str(db_path))
-    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5, 6]
     assert status["pending"] == []
     assert status["issues"] == []
 
@@ -4414,7 +4414,7 @@ def test_migration_status_on_missing_database_reports_all_pending(tmp_path):
     db_path = tmp_path / "missing.db"
     status = database.migration_status(str(db_path))
     assert status["applied"] == []
-    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["pending"]] == [1, 2, 3, 4, 5, 6]
     assert status["issues"] == []
     assert not db_path.exists()
 
@@ -4431,7 +4431,7 @@ def test_concurrent_migrate_applies_each_version_once(tmp_path):
 
     # 每个版本在全部进程中至多被执行一次
     applied = [version for result in results for version in result]
-    assert sorted(applied) == [2, 3, 4, 5]
+    assert sorted(applied) == [2, 3, 4, 5, 6]
 
     import sqlite3
 
@@ -4439,7 +4439,7 @@ def test_concurrent_migrate_applies_each_version_once(tmp_path):
         rows = conn.execute(
             "SELECT version, COUNT(*) FROM schema_migrations GROUP BY version"
         ).fetchall()
-        assert rows == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1)]
+        assert rows == [(1, 1), (2, 1), (3, 1), (4, 1), (5, 1), (6, 1)]
         assert conn.execute(
             "SELECT revision FROM display_names WHERE id = 1"
         ).fetchone() == (1,)
@@ -4451,14 +4451,14 @@ def test_database_cli_migrate_and_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(database, "DATABASE_PATH", str(db_path))
 
     assert database.main(["migrate"]) == 0
-    assert "applied versions: [1, 2, 3, 4, 5]" in capsys.readouterr().out
+    assert "applied versions: [1, 2, 3, 4, 5, 6]" in capsys.readouterr().out
     # 幂等：再次执行无待应用迁移
     assert database.main(["migrate"]) == 0
     assert "up to date" in capsys.readouterr().out
 
     assert database.main(["status"]) == 0
     status = json.loads(capsys.readouterr().out)
-    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5]
+    assert [item["version"] for item in status["applied"]] == [1, 2, 3, 4, 5, 6]
     assert status["pending"] == []
     assert status["issues"] == []
 
@@ -4472,3 +4472,407 @@ def test_database_cli_migrate_and_status(tmp_path, monkeypatch, capsys):
         conn.commit()
     assert database.main(["migrate"]) == 1
     assert "2" in capsys.readouterr().err
+
+
+# ---------- 显示名变更流水 GET /name-events ----------
+
+
+def _events(client, **params):
+    """查询变更流水；params 为查询字符串参数（namespace / after_id / limit）。"""
+    resp = client.get("/name-events", params=params)
+    assert resp.status_code == 200
+    return resp.json()
+
+
+def test_register_appends_insert_event(client):
+    """注册成功：追加一条 insert 事件，只有 new_* 快照。"""
+    resp = register(client, "Ａｌｉｃｅ")
+    assert resp.status_code == 201
+    name_id = resp.json()["id"]
+
+    body = _events(client)
+    assert body["next_cursor"] is None
+    assert len(body["events"]) == 1
+    event = body["events"][0]
+    assert event["id"] == 1  # 事件号从 1 开始单调递增
+    assert event["action"] == "insert"
+    assert event["occurred_at"].endswith("Z")  # UTC ISO 8601
+    # insert 事件：old_* 全为 null，new_* 为落库后的行快照
+    assert event["old_id"] is None
+    assert event["old_namespace"] is None
+    assert event["old_original_name"] is None
+    assert event["old_normalized_name"] is None
+    assert event["old_revision"] is None
+    assert event["new_id"] == name_id
+    assert event["new_namespace"] == "chat"
+    assert event["new_original_name"] == "Ａｌｉｃｅ"
+    assert event["new_normalized_name"] == "alice"
+    assert event["new_revision"] == 1
+
+
+def test_claim_reservation_appends_insert_event(client):
+    """预占本身不产生事件；确认预占写 display_names 时追加 insert 事件。"""
+    resp = client.post(
+        "/namespaces/chat/reservations", json={"name": "paypal", "ttl_seconds": 120}
+    )
+    assert resp.status_code == 201
+    token = resp.json()["token"]
+    # 预占只写 name_reservations，不产生任何事件
+    assert _events(client)["events"] == []
+
+    resp = client.post(f"/namespaces/chat/reservations/{token}/claim")
+    assert resp.status_code == 201
+    name_id = resp.json()["id"]
+
+    events = _events(client)["events"]
+    assert len(events) == 1
+    assert events[0]["action"] == "insert"
+    assert events[0]["new_id"] == name_id
+    assert events[0]["new_namespace"] == "chat"
+    assert events[0]["new_original_name"] == "paypal"
+    assert events[0]["new_revision"] == 1
+
+
+def test_batch_register_appends_one_insert_event_per_name(client):
+    """批量注册：每个名称各产生一条 insert 事件，事件号连续递增。"""
+    resp = register_batch(client, ["alice", "bob", "世界-123"])
+    assert resp.status_code == 201
+
+    events = _events(client)["events"]
+    assert [e["action"] for e in events] == ["insert", "insert", "insert"]
+    assert [e["id"] for e in events] == [1, 2, 3]
+    assert [e["new_original_name"] for e in events] == ["alice", "bob", "世界-123"]
+    assert [e["new_revision"] for e in events] == [1, 1, 1]
+
+
+def test_rename_appends_update_event_with_both_snapshots(client):
+    """改名：追加一条 update 事件，同时保存变更前后两侧快照。"""
+    name_id = register(client, "Alice").json()["id"]
+    resp = client.patch(
+        f"/namespaces/chat/names/{name_id}",
+        json={"name": "Alicia", "expected_revision": 1},
+    )
+    assert resp.status_code == 200
+
+    events = _events(client)["events"]
+    assert [e["action"] for e in events] == ["insert", "update"]
+    event = events[1]
+    assert event["old_id"] == name_id
+    assert event["old_namespace"] == "chat"
+    assert event["old_original_name"] == "Alice"
+    assert event["old_normalized_name"] == "alice"
+    assert event["old_revision"] == 1
+    assert event["new_id"] == name_id
+    assert event["new_namespace"] == "chat"
+    assert event["new_original_name"] == "Alicia"
+    assert event["new_normalized_name"] == "alicia"
+    assert event["new_revision"] == 2
+
+
+def test_swap_appends_update_events_for_both_records(client):
+    """交换：双方记录各产生 revision + 1 的 update 事件（含事务内临时名中间步骤）。"""
+    id_a = register(client, "alice").json()["id"]
+    id_b = register(client, "bob").json()["id"]
+    resp = client.post(
+        "/namespaces/chat/names/swap",
+        json={
+            "records": [
+                {"id": id_a, "expected_revision": 1},
+                {"id": id_b, "expected_revision": 1},
+            ]
+        },
+    )
+    assert resp.status_code == 200
+
+    events = _events(client)["events"]
+    updates = [e for e in events if e["action"] == "update"]
+    # 三步成对互换（逐次记录）：id_a 腾临时名槽（revision 不变）
+    # -> id_b 接管 alice（revision + 1）-> id_a 接管 bob（revision + 1）
+    assert len(updates) == 3
+    assert updates[0]["new_id"] == id_a
+    assert updates[0]["old_original_name"] == "alice"
+    assert updates[0]["new_original_name"].startswith("__swap__/")  # 事务内临时名
+    assert updates[0]["new_revision"] == 1  # 临时名步骤不递增 revision
+
+    final = {e["new_id"]: e for e in updates[1:]}
+    assert final[id_b]["old_original_name"] == "bob"
+    assert final[id_b]["new_original_name"] == "alice"
+    assert final[id_b]["old_revision"] == 1
+    assert final[id_b]["new_revision"] == 2
+    assert final[id_a]["old_original_name"].startswith("__swap__/")  # 从临时名改回
+    assert final[id_a]["new_original_name"] == "bob"
+    assert final[id_a]["old_revision"] == 1
+    assert final[id_a]["new_revision"] == 2
+
+
+def test_merge_appends_namespace_update_events_visible_from_both_sides(client):
+    """合并：每条迁移记录产生 namespace 变更的 update 事件，源 / 目标空间过滤均可见。"""
+    register(client, "alice", namespace="a")
+    register(client, "bob", namespace="a")
+    register(client, "carol", namespace="b")
+    resp = client.post("/namespaces/a/merge", json={"target_namespace": "b"})
+    assert resp.status_code == 200
+    assert resp.json()["merged_names"] == 2
+
+    events = _events(client)["events"]
+    merge_events = [
+        e for e in events
+        if e["action"] == "update" and e["old_namespace"] == "a"
+    ]
+    assert len(merge_events) == 2
+    for event in merge_events:
+        assert event["new_namespace"] == "b"
+        assert event["old_id"] == event["new_id"]  # 合并不改 id
+        assert event["old_revision"] == event["new_revision"]  # 合并不改 revision
+
+    # namespace 过滤匹配变更前或后空间：迁出事件在源、目标两侧都能查到
+    a_events = _events(client, namespace="a")["events"]
+    assert {e["id"] for e in a_events} >= {e["id"] for e in merge_events}
+    b_events = _events(client, namespace="b")["events"]
+    assert {e["id"] for e in b_events} >= {e["id"] for e in merge_events}
+    # 未涉及的空间看不到这些事件
+    assert _events(client, namespace="unrelated")["events"] == []
+
+
+def test_release_appends_delete_event(client):
+    """释放：追加一条 delete 事件，只有 old_* 快照（含删除时的 revision）。"""
+    name_id = register(client, "payfriend").json()["id"]
+    resp = release(client, name_id, expected_revision=1, cooldown_seconds=3600)
+    assert resp.status_code == 200
+
+    events = _events(client)["events"]
+    assert [e["action"] for e in events] == ["insert", "delete"]
+    event = events[1]
+    assert event["old_id"] == name_id
+    assert event["old_namespace"] == "chat"
+    assert event["old_original_name"] == "payfriend"
+    assert event["old_normalized_name"] == "payfriend"
+    assert event["old_revision"] == 1
+    # delete 事件：new_* 全为 null
+    assert event["new_id"] is None
+    assert event["new_namespace"] is None
+    assert event["new_original_name"] is None
+    assert event["new_normalized_name"] is None
+    assert event["new_revision"] is None
+
+
+def test_rolled_back_writes_leave_no_events(client):
+    """业务事务回滚不留事件：冲突注册、混脚本、批量失败、过期版本改名/释放。"""
+    register(client, "Alice")
+
+    # 规范名冲突 -> 409，事务回滚
+    assert register(client, "ALICE").status_code == 409
+    # 混脚本 -> 422，不落库
+    assert register(client, MIXED_ADMIN).status_code == 422
+    # 批量中任一项冲突 -> 422，整批不落库
+    assert register_batch(client, ["ok-name", "alice"]).status_code == 422
+
+    name_id = client.get("/namespaces/chat/names").json()[0]["id"]
+    # expected_revision 过期 -> 409，不改名
+    resp = client.patch(
+        f"/namespaces/chat/names/{name_id}",
+        json={"name": "Alicia", "expected_revision": 99},
+    )
+    assert resp.status_code == 409
+    # 释放版本过期 -> 409，不删除
+    resp = release(client, name_id, expected_revision=99, cooldown_seconds=60)
+    assert resp.status_code == 409
+    # 交换记录缺失 -> 404，不产生事件
+    resp = client.post(
+        "/namespaces/chat/names/swap",
+        json={
+            "records": [
+                {"id": name_id, "expected_revision": 1},
+                {"id": 999, "expected_revision": 1},
+            ]
+        },
+    )
+    assert resp.status_code == 404
+
+    # 全部失败路径都没有留下事件：只有最初成功注册的那一条 insert
+    events = _events(client)["events"]
+    assert len(events) == 1
+    assert events[0]["action"] == "insert"
+    assert events[0]["new_original_name"] == "Alice"
+
+
+def test_name_events_pagination_with_after_id_and_limit(client):
+    """after_id 排他游标 + limit 分页：按事件号升序，next_cursor 衔接下一页。"""
+    register_batch(client, ["n1", "n2", "n3", "n4", "n5"])
+
+    # 第一页：limit=2
+    page1 = _events(client, limit=2)
+    assert [e["id"] for e in page1["events"]] == [1, 2]
+    assert page1["next_cursor"] == 2
+
+    # 第二页：after_id 为排他游标（不重复返回事件 2）
+    page2 = _events(client, after_id=page1["next_cursor"], limit=2)
+    assert [e["id"] for e in page2["events"]] == [3, 4]
+    assert page2["next_cursor"] == 4
+
+    # 最后一页：不足 limit 条时 next_cursor 为 null
+    page3 = _events(client, after_id=page2["next_cursor"], limit=2)
+    assert [e["id"] for e in page3["events"]] == [5]
+    assert page3["next_cursor"] is None
+
+    # 游标越过最大事件号：空页
+    assert _events(client, after_id=5)["events"] == []
+
+    # 默认 limit 为 100：一次返回全部
+    assert len(_events(client)["events"]) == 5
+
+
+def test_name_events_limit_and_after_id_validation(client):
+    """limit 必须在 1–100，after_id 必须非负，否则 422。"""
+    assert client.get("/name-events", params={"limit": 0}).status_code == 422
+    assert client.get("/name-events", params={"limit": 101}).status_code == 422
+    assert client.get("/name-events", params={"after_id": -1}).status_code == 422
+    assert client.get("/name-events", params={"namespace": ""}).status_code == 422
+    # 边界值合法
+    assert client.get("/name-events", params={"limit": 1}).status_code == 200
+    assert client.get("/name-events", params={"limit": 100}).status_code == 200
+    assert client.get("/name-events", params={"after_id": 0}).status_code == 200
+
+
+def test_name_events_namespace_filter_matches_either_side(client):
+    """namespace 过滤只匹配变更前或后空间，与其他空间的事件隔离。"""
+    register(client, "alice", namespace="chat")
+    register(client, "bob", namespace="forum")
+
+    chat_events = _events(client, namespace="chat")["events"]
+    assert len(chat_events) == 1
+    assert chat_events[0]["new_original_name"] == "alice"
+
+    forum_events = _events(client, namespace="forum")["events"]
+    assert len(forum_events) == 1
+    assert forum_events[0]["new_original_name"] == "bob"
+
+    # 过滤与分页参数可组合
+    paged = _events(client, namespace="chat", after_id=0, limit=1)
+    assert len(paged["events"]) == 1
+    assert paged["next_cursor"] is None
+
+
+def test_openapi_documents_name_events_endpoint(client):
+    """OpenAPI 文档包含 /name-events 及其分页参数。"""
+    spec = client.get("/openapi.json").json()
+    get_op = spec["paths"]["/name-events"]["get"]
+    assert "200" in get_op["responses"]
+    param_names = {p["name"] for p in get_op["parameters"]}
+    assert {"namespace", "after_id", "limit"} <= param_names
+
+
+def test_init_db_creates_name_events_table_and_triggers_idempotently(tmp_path):
+    """新库自动建 name_events 表与三个审计触发器，重复初始化不报错。"""
+    db_path = tmp_path / "events.db"
+    database.init_db(str(db_path))
+    database.init_db(str(db_path))
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(name_events)")
+        }
+        assert columns == {
+            "id",
+            "occurred_at",
+            "action",
+            "old_id",
+            "old_namespace",
+            "old_original_name",
+            "old_normalized_name",
+            "old_revision",
+            "new_id",
+            "new_namespace",
+            "new_original_name",
+            "new_normalized_name",
+            "new_revision",
+        }
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        assert triggers == {
+            "trg_display_names_audit_insert",
+            "trg_display_names_audit_update",
+            "trg_display_names_audit_delete",
+        }
+
+
+def test_migrate_to_v6_does_not_backfill_events_for_existing_rows(tmp_path):
+    """存量数据不补造旧事件：v1–v5 形态的既有库升级后历史行无事件，新变更正常记录。"""
+    db_path = tmp_path / "legacy-events.db"
+    import sqlite3
+
+    # 构造 v1–v5 形态的既有库（含业务数据，无 name_events 与触发器）
+    with sqlite3.connect(db_path) as legacy:
+        legacy.executescript(
+            """
+            CREATE TABLE display_names (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace       TEXT NOT NULL,
+                original_name   TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                UNIQUE (namespace, normalized_name)
+            );
+            CREATE INDEX idx_display_names_namespace
+                ON display_names (namespace);
+            ALTER TABLE display_names
+                ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+            CREATE TABLE name_reservations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace       TEXT NOT NULL,
+                original_name   TEXT NOT NULL,
+                normalized_name TEXT NOT NULL,
+                token           TEXT NOT NULL UNIQUE,
+                expires_at      TEXT NOT NULL,
+                consumed_at     TEXT,
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE INDEX idx_name_reservations_namespace_active
+                ON name_reservations (namespace, consumed_at, expires_at);
+            CREATE TABLE namespace_script_policies (
+                namespace            TEXT PRIMARY KEY,
+                blocked_script_pairs TEXT NOT NULL,
+                revision             INTEGER NOT NULL DEFAULT 1,
+                created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                updated_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE TABLE name_cooldowns (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                namespace        TEXT NOT NULL,
+                original_name    TEXT NOT NULL,
+                normalized_name  TEXT NOT NULL,
+                cooldown_seconds INTEGER NOT NULL,
+                expires_at       TEXT NOT NULL,
+                created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+            CREATE INDEX idx_name_cooldowns_namespace
+                ON name_cooldowns (namespace, expires_at);
+            INSERT INTO display_names (namespace, original_name, normalized_name)
+            VALUES ('chat', 'Alice', 'alice');
+            """
+        )
+        legacy.commit()
+
+    applied = database.migrate(str(db_path))
+    assert applied == [6]  # 只需补应用 v6
+
+    with sqlite3.connect(db_path) as conn:
+        # 存量行不补造任何历史事件
+        assert conn.execute("SELECT COUNT(*) FROM name_events").fetchone() == (0,)
+        # 升级后的新变更由触发器正常记录
+        conn.execute(
+            "UPDATE display_names SET original_name = 'Alicia', "
+            "normalized_name = 'alicia', revision = revision + 1 WHERE id = 1"
+        )
+        conn.commit()
+        rows = conn.execute(
+            "SELECT action, old_original_name, new_original_name, "
+            "old_revision, new_revision FROM name_events"
+        ).fetchall()
+        assert rows == [("update", "Alice", "Alicia", 1, 2)]

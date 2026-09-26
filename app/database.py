@@ -21,6 +21,15 @@ name_cooldowns 保存“名称释放冷却”记录：DELETE 已注册名称时�
 冷却记录与 display_names / 有效预占一样参与全部冲突与混脚本判定；到期记录
 在后续写事务中惰性物理删除。
 
+name_events 保存“显示名变更流水”：由 display_names 上的 INSERT / UPDATE /
+DELETE 审计触发器在**同一事务**内逐次写入——每条事件记录事件号（自增 id）、
+UTC 时刻（occurred_at）、动作（insert / update / delete）与变更前后两侧的
+id / namespace / original_name / normalized_name / revision（insert 无
+old_*，delete 无 new_*）。注册、预占确认、改名、交换（含事务内临时名的
+中间步骤）、命名空间合并与释放对 display_names 的全部行变更都由此记录；
+触发器与触发语句同属一个事务，业务回滚时事件一并回滚，绝不留下孤儿事件。
+迁移只建表与触发器，不为存量 display_names 行补造历史事件。
+
 版本化迁移机制（取代旧的“启动时幂等建表”）：
 
 - 全部表结构变更定义为 MIGRATIONS 中按版本号递增的不可变迁移；每个迁移
@@ -179,6 +188,85 @@ MIGRATIONS: tuple[Migration, ...] = (
             """,
         ),
     ),
+    Migration(
+        6,
+        "create_name_events",
+        (
+            # 显示名变更流水：只由下面三个审计触发器写入，应用层不直接写。
+            # old_* / new_* 分别保存变更前 / 后的行快照；insert 只有 new_*，
+            # delete 只有 old_*，update 两侧俱全（交换的临时名中间步骤也逐次记录）
+            """
+            CREATE TABLE name_events (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                occurred_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                action              TEXT NOT NULL CHECK (action IN ('insert', 'update', 'delete')),
+                old_id              INTEGER,
+                old_namespace       TEXT,
+                old_original_name   TEXT,
+                old_normalized_name TEXT,
+                old_revision        INTEGER,
+                new_id              INTEGER,
+                new_namespace       TEXT,
+                new_original_name   TEXT,
+                new_normalized_name TEXT,
+                new_revision        INTEGER
+            )
+            """,
+            # GET /name-events 按 namespace 过滤（匹配变更前或后空间）的索引；
+            # 不带过滤时按主键 id 升序分页即可
+            """
+            CREATE INDEX idx_name_events_old_namespace
+                ON name_events (old_namespace, id)
+            """,
+            """
+            CREATE INDEX idx_name_events_new_namespace
+                ON name_events (new_namespace, id)
+            """,
+            # 三个审计触发器与触发语句同属一个事务：业务回滚时事件一并回滚
+            """
+            CREATE TRIGGER trg_display_names_audit_insert
+            AFTER INSERT ON display_names
+            BEGIN
+                INSERT INTO name_events
+                    (action, new_id, new_namespace, new_original_name,
+                     new_normalized_name, new_revision)
+                VALUES
+                    ('insert', NEW.id, NEW.namespace, NEW.original_name,
+                     NEW.normalized_name, NEW.revision);
+            END
+            """,
+            """
+            CREATE TRIGGER trg_display_names_audit_update
+            AFTER UPDATE ON display_names
+            BEGIN
+                INSERT INTO name_events
+                    (action,
+                     old_id, old_namespace, old_original_name,
+                     old_normalized_name, old_revision,
+                     new_id, new_namespace, new_original_name,
+                     new_normalized_name, new_revision)
+                VALUES
+                    ('update',
+                     OLD.id, OLD.namespace, OLD.original_name,
+                     OLD.normalized_name, OLD.revision,
+                     NEW.id, NEW.namespace, NEW.original_name,
+                     NEW.normalized_name, NEW.revision);
+            END
+            """,
+            """
+            CREATE TRIGGER trg_display_names_audit_delete
+            AFTER DELETE ON display_names
+            BEGIN
+                INSERT INTO name_events
+                    (action, old_id, old_namespace, old_original_name,
+                     old_normalized_name, old_revision)
+                VALUES
+                    ('delete', OLD.id, OLD.namespace, OLD.original_name,
+                     OLD.normalized_name, OLD.revision);
+            END
+            """,
+        ),
+    ),
 )
 
 _MIGRATIONS_BY_VERSION = {migration.version: migration for migration in MIGRATIONS}
@@ -224,6 +312,8 @@ def _detect_legacy_applied(conn: sqlite3.Connection) -> set[int]:
         applied.add(4)
     if "name_cooldowns" in tables:
         applied.add(5)
+    if "name_events" in tables:
+        applied.add(6)
     return applied
 
 

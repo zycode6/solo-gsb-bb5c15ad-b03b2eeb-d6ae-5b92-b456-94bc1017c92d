@@ -633,3 +633,43 @@ class NameAllocateResponse(BaseModel):
 class ErrorDetail(BaseModel):
     error: str
     message: str
+
+
+# ---------- 显示名变更流水 GET /name-events ----------
+
+# 变更动作：插入（注册 / 预占确认）、更新（改名 / 交换 / 命名空间合并）、删除（释放）
+NameEventAction = Literal["insert", "update", "delete"]
+
+
+class NameEventRecord(BaseModel):
+    """显示名变更流水事件：display_names 行级变更的审计记录（触发器同事务写入）。
+
+    old_* / new_* 为变更前 / 后的行快照：insert 事件 old_* 全为 None，
+    delete 事件 new_* 全为 None，update 事件两侧俱全。
+    """
+
+    id: int = Field(description="事件号：全库单调递增，与事件发生顺序一致")
+    occurred_at: str = Field(description="事件发生时刻（UTC ISO 8601，毫秒精度）")
+    action: NameEventAction
+    old_id: int | None = Field(description="变更前的 display_names id；insert 事件为 null")
+    old_namespace: str | None = Field(description="变更前的命名空间；insert 事件为 null")
+    old_original_name: str | None = Field(description="变更前的原名；insert 事件为 null")
+    old_normalized_name: str | None = Field(description="变更前的规范名；insert 事件为 null")
+    old_revision: int | None = Field(description="变更前的乐观锁版本；insert 事件为 null")
+    new_id: int | None = Field(description="变更后的 display_names id；delete 事件为 null")
+    new_namespace: str | None = Field(description="变更后的命名空间；delete 事件为 null")
+    new_original_name: str | None = Field(description="变更后的原名；delete 事件为 null")
+    new_normalized_name: str | None = Field(description="变更后的规范名；delete 事件为 null")
+    new_revision: int | None = Field(description="变更后的乐观锁版本；delete 事件为 null")
+
+
+class NameEventsResponse(BaseModel):
+    """变更流水分页响应：事件按事件号升序，next_cursor 供下一页排他游标使用。"""
+
+    events: list[NameEventRecord] = Field(description="本页事件，按事件号升序")
+    next_cursor: int | None = Field(
+        description=(
+            "下一页的排他游标（本页最后一条事件的事件号）；"
+            "为 null 表示没有更多事件，翻页时作为 after_id 传入"
+        )
+    )

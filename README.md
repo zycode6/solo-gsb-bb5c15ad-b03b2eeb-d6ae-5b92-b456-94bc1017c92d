@@ -29,6 +29,8 @@
 
 还支持**单命名空间快照 Merkle 包含证明**：`POST /namespaces/{namespace}/snapshot-proof` 接收 1–20 个由 `kind`（`registered` / `reservation` / `released`）与 `id` 表示的节点及 `max_nodes`（1–500），在**单个 SQLite 读事务**中固定该空间的**生效脚本策略、已注册名称、有效预占与未过期释放冷却**。叶集合为 1 个恒存在的 `script_policy` 叶（排序后下标恒为 0；命名空间未配置策略时固定内建默认策略、`revision=0`）加全部业务叶，按 **（类型序, id）** 排序（`script_policy < registered < reservation < released`），业务字段编码为**规范 JSON**（键按字典序、无多余空白、非 ASCII 原样 UTF-8），以 SHA-256 构建 Merkle 树：叶 `H(0x00‖json)`、父 `H(0x01‖left‖right)`、每层奇数个节点时**复制末节点**与自身配对。返回 `root`、`leaf_count`（业务节点数 + 1 个策略叶）、`snapshot_count`、生效策略回显及每个请求节点的叶载荷 / 叶下标 / **带左右方向的包含证明**（`direction` 为兄弟方向，验证时 `left` 取 `H(0x01‖sibling‖current)`、`right` 取 `H(0x01‖current‖sibling)`）。**证明只由节点排序后的位置决定：相同快照下请求节点顺序变化不改变根，也不改变各节点自身的证明**，`items` 仅按请求顺序回显。请求节点在快照中不存在（不存在 / 预占或冷却已过期 / 预占已消费 / 属于其他命名空间）-> `404 snapshot_nodes_not_found`（附全部缺失 `kind/id`）；业务快照总量超过 `max_nodes` -> `413 snapshot_too_large`，**不截断、不建树**。
 
+还支持**显示名变更流水**：数据库迁移为 `display_names` 的 INSERT / UPDATE / DELETE 建立**同事务审计触发器**，把每一次行变更逐次记录到 `name_events` 表——每条事件含事件号（自增 `id`）、UTC 时刻（`occurred_at`）、动作（`insert` / `update` / `delete`）与**变更前后两侧**的 `id` / `namespace` / `original_name` / `normalized_name` / `revision`（insert 无 `old_*`，delete 无 `new_*`）。注册、预占确认、改名、交换（含事务内临时名的中间步骤）、命名空间合并与释放的全部变更都由此记录；触发器与业务语句同属一个事务，**业务回滚时事件一并回滚**，绝不留下孤儿事件；迁移只建表与触发器，**不为存量数据补造历史事件**。`GET /name-events` 按事件号升序分页查询：`after_id` 为排他游标（只返回事件号大于它的事件），`limit` 为单页条数（1–100，默认 100），响应的 `next_cursor` 为本页最后一条事件号（作为下一次的 `after_id`），为 `null` 表示没有更多事件；`namespace` 过滤匹配变更前**或**变更后的命名空间（合并迁出源空间、迁入目标空间的事件在两侧都能查到）。
+
 ## 快速开始（Docker，单条命令）
 
 ```bash
@@ -43,7 +45,8 @@ uvicorn；迁移校验失败（迁移文件被改写 / 版本缺口）时容器�
 （含 `PUT/GET /namespaces/{namespace}/script-policy`、`POST /namespaces/{source}/merge`、
 `DELETE /namespaces/{namespace}/names/{id}` 释放冷却、`POST /name-risk-clusters`
 跨空间同形风险簇、`POST /namespaces/{namespace}/snapshot-proof` 快照 Merkle
-包含证明与 `POST /namespaces/{namespace}/names/allocate` 候选集原子注册）。
+包含证明、`POST /namespaces/{namespace}/names/allocate` 候选集原子注册与
+`GET /name-events` 显示名变更流水）。
 
 - **API 地址：http://localhost:8000**
 - **交互式文档（Swagger UI）：http://localhost:8000/docs**
@@ -103,6 +106,7 @@ uvicorn app.main:app --reload --port 8000
 | `POST` | `/name-risk-clusters` | **跨空间同形风险簇**：`{"namespaces": ["a","b", ...], "max_names": ≤500}`（2–20 个互不相同的命名空间），单个 SQLite 读事务固定各空间已注册名称 / 有效预占 / 未过期冷却快照，只对跨空间节点按规范名相同或同形建边，按连通分量返回至少含 2 个节点的簇（A-B、B-C 即使 A-C 不冲突也同簇）→ `200`；快照总量超过 `max_names` → `413`（不截断计算）；命名空间数量 / 重复 / `max_names` 越界 → `422` |
 | `POST` | `/namespaces/{namespace}/snapshot-proof` | **快照 Merkle 包含证明**：`{"nodes": [{"kind": "registered"|"reservation"|"released", "id": ...}, ...], "max_nodes": ≤500}`（1–20 个互不相同的 kind/id），单个 SQLite 读事务固定生效脚本策略 + 已注册名称 + 有效预占 + 未过期冷却，按（类型序, id）排序后以规范 JSON + SHA-256 建树（叶 `0x00`、父 `0x01`、奇数层复制末节点）→ `200` 返回 `root` / `leaf_count` 与各节点带左右方向的包含证明（与请求顺序无关）；节点不在快照中 → `404`；业务快照超过 `max_nodes` → `413`（不截断、不建树）；nodes 数量 / 重复 / `max_nodes` 越界 → `422` |
 | `GET` | `/namespaces/{namespace}/names` | 列出命名空间内已注册名称（预占未确认前不出现在此） |
+| `GET` | `/name-events` | **显示名变更流水**：`display_names` 行级变更的审计事件（触发器同事务写入，回滚不留事件），按事件号升序分页。查询参数：`namespace`（可选，匹配变更前**或**后空间）、`after_id`（排他游标，默认 0）、`limit`（1–100，默认 100）→ `200` 返回 `events` 与 `next_cursor`（为 `null` 表示没有更多）；参数越界 → `422` |
 | `GET` | `/health` | 健康检查 |
 
 单条接口请求体为 `{"name": "<显示名>"}`（1–64 字符，非空白）；候选集原子注册接口请求体为 `{"items": [{"client_id": "<1–64 字符非空白、请求内唯一>", "candidates": ["<候选名>", ...]}, ...]}`，**1–20 个申请项、每项 1–10 个候选名**（候选名沿用单条接口的 1–64 字符非空白约束，按优先级从高到低排列；同一项内允许重复候选名）；改名接口为 `{"name": "<新显示名>", "expected_revision": <上次读取的 revision，≥1 的整数>}`；删除（释放）接口为 `{"expected_revision": <≥1 的整数>, "cooldown_seconds": <60–86400 的整数>}`；交换接口为 `{"records": [{"id": <记录 id>, "expected_revision": <≥1 的整数>}, ...]}`（**恰好两条，且 id 不能相同**，响应 `items` 按请求顺序返回）；批量接口为 `{"names": ["<显示名>", ...]}`（1–50 个）；预占接口为 `{"name": "<显示名>", "ttl_seconds": 30–600}`；合并接口为 `{"target_namespace": "<目标命名空间>"}`（1–64 字符，非空白，且不得与源相同）；风险簇接口为 `{"namespaces": ["<命名空间>", ...], "max_names": <1–500 的整数>}`（**恰好 2–20 个且互不相同**，响应与输入顺序无关——`namespaces` 回显为按字典序规范化后的列表）；快照证明接口为 `{"nodes": [{"kind": "registered"|"reservation"|"released", "id": <≥1 的整数>}, ...], "max_nodes": <1–500 的整数>}`（**1–20 个且 `(kind, id)` 互不相同**；`registered` 与 `reservation` 的同 id 是不同节点，不视为重复；`items` 按请求顺序回显，但根与各节点证明与请求顺序无关）。
@@ -680,6 +684,45 @@ assert h.hex() == root
 # nodes 为空 / 超过 20 个 / (kind,id) 重复 / id<1 / kind 非法 / max_nodes 越界 -> 422
 ```
 
+显示名变更流水：注册、改名、释放等每一次 `display_names` 行变更都由数据库
+审计触发器在**同一事务**内逐次记录（业务回滚不留事件；存量数据不补造历史
+事件）。按事件号升序分页，`next_cursor` 为 `null` 表示没有更多事件：
+
+```bash
+# 注册 "Alice"（id=1）-> 改名为 "Alicia" -> 释放删除后：
+curl http://localhost:8000/name-events
+# 200 {"events":[
+#   {"id":1,"occurred_at":"2026-09-26T12:00:01.123Z","action":"insert",
+#    "old_id":null,"old_namespace":null,"old_original_name":null,
+#    "old_normalized_name":null,"old_revision":null,
+#    "new_id":1,"new_namespace":"chat","new_original_name":"Alice",
+#    "new_normalized_name":"alice","new_revision":1},
+#   {"id":2,"occurred_at":"2026-09-26T12:01:00.456Z","action":"update",
+#    "old_id":1,"old_namespace":"chat","old_original_name":"Alice",
+#    "old_normalized_name":"alice","old_revision":1,
+#    "new_id":1,"new_namespace":"chat","new_original_name":"Alicia",
+#    "new_normalized_name":"alicia","new_revision":2},
+#   {"id":3,"occurred_at":"2026-09-26T12:02:00.789Z","action":"delete",
+#    "old_id":1,"old_namespace":"chat","old_original_name":"Alicia",
+#    "old_normalized_name":"alicia","old_revision":2,
+#    "new_id":null,"new_namespace":null,"new_original_name":null,
+#    "new_normalized_name":null,"new_revision":null}],
+#  "next_cursor":null}
+```
+
+按命名空间过滤（匹配变更前**或**后空间：合并迁出 / 迁入的事件两侧都能
+查到）并用 `after_id` 排他游标 + `limit`（1–100，默认 100）翻页：
+
+```bash
+curl 'http://localhost:8000/name-events?namespace=chat&limit=2'
+# 200 {"events":[...事件 1、2...],"next_cursor":2}
+
+curl 'http://localhost:8000/name-events?namespace=chat&after_id=2&limit=2'
+# 200 {"events":[...事件 3...],"next_cursor":null}   # after_id 为排他游标
+```
+
+`limit` 超出 1–100、`after_id` 为负或 `namespace` 为空白 -> `422`。
+
 ## 判定规则说明
 
 1. **规范化**：`unicodedataplus.normalize("NFKC", name).casefold()`。NFKC 折叠全半角、合字等兼容字符，casefold 折叠大小写（比 lower 更彻底，如 `ß`→`ss`）。
@@ -695,6 +738,7 @@ assert h.hex() == root
 11. **跨空间同形风险簇（POST /name-risk-clusters）**：请求体为 `{"namespaces": [2–20 个互不相同的 1–64 字符非空白命名空间], "max_names": 1–500 的整数}`，数量越界、含重复项或 `max_names` 越界均由 Pydantic 拒绝（`422`）。服务端先把输入命名空间集合按字典序规范化，再在**同一个只读事务（`BEGIN` 读事务）**中依次读取这些空间的全部已注册名称、未消费未过期预占与未过期冷却（三条查询共享同一份数据库快照：事务期间其他连接提交的注册 / 预占 / 删除对本连接不可见；只读路径不做惰性清理，过期 / 已消费记录仅在 Python 侧按 `expires_at` / `consumed_at` 过滤，与 `check` 一致）。三类记录合计的**快照节点总量**一旦超过 `max_names` 立即抛错并由接口层返回 `413 risk_snapshot_too_large`（附 `snapshot_count` 与 `max_names`），读事务整体回滚（只读无副作用），**绝不截断快照后继续计算**——上限只过滤时间维度（过期 / 已消费），不限制命名空间数量。未超限才在内存中建模：节点稳定标识为 `(namespace, kind, id)`（`kind ∈ registered / reservation / released`，排序序值 registered < reservation < released；预占与冷却节点附 `expires_at`，已注册节点无该字段），并带 `original_name` / `normalized_name`。建边**只发生在不同命名空间的节点之间**：先按 `normalized_name` 分组、组内跨空间两两连 `normalized_match` 边（同空间写入时已保证规范名唯一）；再对不同的规范名两两调用 `is_confusable`（按无序规范名对去重判定，避免对多节点共享的规范名重复计算），命中且两端空间不同则连 `confusable` 边。随后以并查集（按秩合并 + 路径压缩）求连通分量，只保留至少含 2 个节点的分量——**A-B、B-C 建边而 A-C 不直接冲突时，三者仍归入同一簇**；孤立节点（含仅与同空间记录“疑似相似”但无跨空间边的节点）一律丢弃。输出完全确定性排序：簇内节点按 `(namespace, kind 序, id)` 升序；边端点按节点键小者为 `source`、大者为 `target`，边按 `(source, target, reasons)` 升序（`reasons` 内 `normalized_match` 在 `confusable` 前）；簇按簇内最小节点键升序排列并从 1 顺序赋予 `cluster_id`。响应顶层回显字典序 `namespaces`、`max_names` 与 `snapshot_count`；命名空间全部不存在 / 为空时 `snapshot_count=0`、`clusters=[]`。该接口为纯只读分析，不创建表、不写数据，Docker 一键启动后可直接使用。
 12. **快照 Merkle 包含证明（POST /namespaces/{namespace}/snapshot-proof）**：请求体为 `{"nodes": [1–20 个 {"kind": registered|reservation|released, "id": ≥1}], "max_nodes": 1–500 的整数}`，节点数量越界、含重复 `(kind, id)`（不同 kind 的同 id 不算重复，因三类表的 id 空间独立）、id 非正、kind 非法或 `max_nodes` 越界均由 Pydantic 拒绝（`422`）。服务端在**同一个只读事务（`BEGIN` 读事务）**中依次读取该命名空间的生效脚本策略、全部已注册名称、未消费未过期预占与未过期释放冷却（四个读取共享同一份数据库快照：事务期间其他连接提交的策略 PUT / 注册 / 预占 / 释放对本连接不可见；只读路径不做惰性清理，过期 / 已消费记录仅在 Python 侧按 `expires_at` / `consumed_at` 过滤，与风险簇、`check` 一致），读事务以 rollback 结束（只读无副作用）。业务快照节点总量（已注册 + 预占 + 冷却，**不含策略叶**）一旦超过 `max_nodes` 立即返回 `413 snapshot_too_large`（附 `snapshot_count` / `max_nodes`），**不截断快照、不构建 Merkle 树**，且 413 判定优先于节点存在性（404）判定。未超限再校验请求的全部 `(kind, id)` 均在快照中，任一缺失（记录不存在、属于其他命名空间、预占 / 冷却已过期或预占已消费）返回 `404 snapshot_nodes_not_found`，`missing` 按请求顺序列出全部缺失引用。叶集合恒为 **1 个 `script_policy` 叶**（固定 `id=0`，排序后下标恒为 0；命名空间已配置时承诺库中 `revision` 与规范脚本对，未配置时 `configured=false`、`revision=0`、承诺内建默认三对——与各写入 / check 接口实际生效的判定一致，故默认策略与后续 PUT 都体现在根里）加全部业务叶，按 **(类型序, id)** 排序，序值 `script_policy=0 < registered=1 < reservation=2 < released=3`（同类 SQL 已按 id 升序）。每个叶把**业务字段**（不含预占 token 等能力凭证；字段集合跨类型固定、不适用为 `null`；策略叶另含固定 `id=0`）编码为**规范 JSON**——`json.dumps(ensure_ascii=False, sort_keys=True, separators=(",", ":"))` 后 UTF-8 编码（非 ASCII 字符原样保留），叶哈希 `SHA-256(0x00 ‖ canonical_json)`，父哈希 `SHA-256(0x01 ‖ left ‖ right)`；每层节点数为奇数时**复制本层最后一个节点**与自身配对（末节点证明第一层的兄弟即其自身、方向 `right`），单叶树根即叶哈希（本接口因策略叶恒在，实际至少 2 叶）。包含证明自叶向上给出每一层兄弟哈希（十六进制）与方向：兄弟在左 `direction="left"`（`parent=H(0x01‖sibling‖current)`），兄弟在右 `"right"`（`parent=H(0x01‖current‖sibling)`），单叶树为空列表。**证明只由节点排序后的全局下标决定，与请求中的顺序及其他请求节点无关**：相同快照下请求顺序变化或请求子集变化都不改变根，也不改变任一节点自身的 `leaf` / `leaf_index` / `proof`；`items` 仅按请求顺序回显以便客户端对齐。`0x00` / `0x01` 域分隔前缀防止叶哈希与内部节点哈希互通（第二原像防护）。响应附 `root`、`leaf_count`（业务节点数 + 1）、`snapshot_count`（业务节点数，即 413 判定值）、生效策略回显与每项叶载荷（含 `leaf_hash`），客户端可仅凭响应 JSON 独立重放证明核对根。该接口为纯只读分析，不写数据，Docker 一键启动后可直接使用。
 13. **候选集原子注册（POST /namespaces/{namespace}/names/allocate）**：请求体为 `{"items": [1–20 个 {"client_id": 1–64 字符非空白且请求内互不相同, "candidates": [1–10 个按优先级排列的显示名]}]}`，项数 / 每项候选数 / `client_id` 重复或空白 / 候选名不合法均由 Pydantic 拒绝（`422`；同一项内允许重复候选名）。服务端在**单个 `BEGIN IMMEDIATE` 写锁事务**中完成全部工作：① 持写锁后先惰性清理该空间过期预占与冷却（与其他写入口一致；失败回滚时清理也随事务撤销）；② 对每个候选做静态判定——按所属空间**事务内重新加载的生效脚本策略**做混脚本分析（命中即记 `mixed_script` 阻断及脚本明细），并与库内已注册名称、有效预占、未过期冷却逐条做规范名相等 / confusables 同形判定（命中即记 `existing_conflict`，`source` / `reason` / `expires_at` 字段与注册接口冲突明细完全一致）；③ 对**不同申请项之间**的候选两两判定（同规范名直接记 `normalized_match`，否则按无序规范名对去重后调用一次 `is_confusable`，命中记 `confusable`；同一申请项内部不比），建立候选冲突图；④ 回溯 DFS 按申请项请求顺序、候选优先级顺序枚举可行组合，每尝试扩展一个申请项的选择计一个**搜索状态**：带静态阻断的候选直接跳过、与已选候选冲突的候选剪枝，并做前向校验（剩余每个申请项在当前已选组合下至少还剩一个候选才深入，剪枝只删不可行分支，不改变找到的第一个解）；遍历状态数一旦 **超过 10000**（`MAX_ALLOCATION_STATES`）立即抛 `AllocationSearchTooLargeError`（-> `413 allocation_search_too_large`，附 `states_explored` / `limit`），放弃搜索并整体回滚，**绝不写库**。因枚举顺序即“申请项下标优先、候选下标其次”，找到的第一个解就是**各项候选序号向量的字典序最小解**（确定性，与并发无关）。找到解后在同一事务按解一次性 `INSERT` 全部 `display_names`（revision=1），唯一约束 / 锁竞争异常整体回滚并由接口层返回 `409 allocation_conflict` 供客户端重试。不存在可行组合时抛 `AllocationImpossibleError`（-> `409 allocation_impossible`）：全局无解意味着**每个**申请项都不存在可与其余项共同满足的候选，故 `items` 列出全部申请项，逐项逐候选给出 `blocks`——静态阻断（`mixed_script` / `existing_conflict`）优先；静态可选的候选再列出与之冲突的其他申请项**静态可选**候选（`request_conflict`，按对方申请项下标、候选下标排列；静态不可选的对方候选因其不可能入选而不列）；候选本身合法且不与任何单项候选直接冲突、但其余申请项相互牵制导致无全局解时给出 `group_infeasible`。任何失败路径（409 / 413 / 锁竞争）都在事务内整体回滚，**绝不写入部分结果**。该接口无需新表或迁移，Docker 一键启动后可直接使用。
+14. **显示名变更流水（GET /name-events）**：版本化迁移 v6 为 `display_names` 建立 `name_events` 表与三个审计触发器（`AFTER INSERT` / `AFTER UPDATE` / `AFTER DELETE`）。触发器把每一次行变更**逐次**写入 `name_events`：事件号（`id` 自增主键，全库单调递增）、UTC 时刻（`occurred_at`，毫秒精度 ISO 8601）、动作（`action` ∈ `insert` / `update` / `delete`）与变更前后两侧快照（`old_id` / `old_namespace` / `old_original_name` / `old_normalized_name` / `old_revision` 与对应 `new_*`；insert 事件 `old_*` 全为 `NULL`，delete 事件 `new_*` 全为 `NULL`，update 事件两侧俱全）。注册、批量注册、候选集原子注册与预占确认产生 `insert`；改名、交换与命名空间合并产生 `update`（交换的三步成对互换逐次记录，包含事务内临时名的中间步骤——该步骤不递增 `revision`；合并只改 `namespace`，`id` / `revision` 不变）；释放产生 `delete`。SQLite 触发器与触发语句**同属一个事务**：业务事务回滚（冲突 409、混脚本 422、版本过期等任何失败路径）时事件一并回滚，**绝不留下孤儿事件**；应用层不直接写 `name_events`，全部事件只能由触发器产生。迁移只建表与触发器，**不为存量 `display_names` 行补造历史事件**（既有库升级后，升级前的变更无事件可查，升级后的新变更正常记录）。`GET /name-events` 为纯只读分页查询：`after_id`（默认 0）为排他游标，只返回事件号大于它的事件；`limit` 为单页条数（1–100，默认 100，越界 `422`）；事件按事件号升序返回，服务端多取一条探测是否还有后续——有则 `next_cursor` 为本页最后一条事件号（作为下一次的 `after_id`），否则为 `null`。`namespace` 查询参数（可选）过滤变更前（`old_namespace`）**或**变更后（`new_namespace`）属于该空间的事件：合并迁出源空间、迁入目标空间的 `update` 事件在两侧都能查到，未涉及的空间互不可见。
 
 ## 运行测试
 
@@ -714,7 +758,7 @@ pytest
 ```
 app/
   main.py       # FastAPI 路由与错误响应（200/201/409/422/410/404/413）
-  service.py    # 注册/改名/交换/释放冷却/批量/预占/确认/合并/策略/跨空间风险簇/快照包含证明/候选集原子注册业务逻辑，逐条冲突判定与事务控制
+  service.py    # 注册/改名/交换/释放冷却/批量/预占/确认/合并/策略/跨空间风险簇/快照包含证明/候选集原子注册/变更流水查询业务逻辑，逐条冲突判定与事务控制
   merkle.py     # 规范 JSON 编码与 SHA-256 Merkle 树（叶 0x00 / 父 0x01 / 奇数层复制末节点）及包含证明
   analysis.py   # NFKC+casefold 规范化、脚本与码点分析、脚本对规范化与校验
   database.py   # SQLite 连接与版本化 schema 迁移（schema_migrations 记录版本/名称/SHA-256/applied_at；python -m app.database migrate|status）
@@ -731,3 +775,4 @@ requirements.txt  requirements-dev.txt
 - `name_reservations`：预占记录（`token` 唯一、`expires_at`、`consumed_at`）；仅未消费且未过期的行参与冲突判定与策略影响面扫描，过期行惰性物理删除。
 - `namespace_script_policies`：命名空间混脚本策略（每空间至多一行），`blocked_script_pairs` 为 JSON 文本保存的无序去重规范脚本对，`revision` 首次配置为 1、每次成功 PUT 递增；未配置的空间不设行（逻辑版本 0），写入与 `check` 按内建默认策略判定。
 - `name_cooldowns`：名称释放冷却记录（DELETE 时与名称删除在同一事务写入），保存 `original_name` / `normalized_name` / `cooldown_seconds` / `expires_at`；仅未过期行参与冲突判定、合并迁移与策略影响面扫描，过期行在后续写事务中惰性物理删除。老版本数据库由版本化迁移（v5 建表）在启动时自动获得该表。
+- `name_events`：显示名变更流水（v6 建表 + `display_names` 的 INSERT / UPDATE / DELETE 三个审计触发器）。每行一次变更事件：`id`（事件号，自增）、`occurred_at`（UTC 时刻）、`action`（`insert` / `update` / `delete`）与变更前后两侧的 `id` / `namespace` / `original_name` / `normalized_name` / `revision`（`old_*` / `new_*`，insert 无 `old_*`、delete 无 `new_*`）。触发器与业务语句同属一个事务，业务回滚时事件一并回滚；应用层不直接写本表。迁移不为存量数据补造历史事件；`GET /name-events` 按事件号升序提供 `after_id` 排他游标分页（`limit` 1–100）与 `namespace`（匹配变更前或后空间）过滤。

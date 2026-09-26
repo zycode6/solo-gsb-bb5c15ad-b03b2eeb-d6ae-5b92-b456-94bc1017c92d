@@ -17,6 +17,7 @@
 - GET    /namespaces/{namespace}/names                              列出命名空间内已注册名称
 - POST   /name-risk-clusters                                        跨空间同形风险簇（200 / 413 / 422，单一读事务快照）
 - POST   /namespaces/{namespace}/snapshot-proof                     快照 Merkle 包含证明（200 / 404 / 413 / 422，单一读事务快照）
+- GET    /name-events                                               显示名变更流水（200 / 422，触发器同事务记录，游标分页）
 - GET    /health                                                    健康检查
 """
 from __future__ import annotations
@@ -25,7 +26,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 import sqlite3
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, Query, status
 
 from . import database, service
 from .analysis import normalize_name
@@ -39,6 +40,7 @@ from .schemas import (
     MergeResult,
     NameAllocateRequest,
     NameAllocateResponse,
+    NameEventsResponse,
     NameRecord,
     NameRequest,
     NameRiskClustersRequest,
@@ -65,7 +67,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Unicode Display Name Anti-Spoofing API",
-    version="1.9.0",
+    version="1.10.0",
     description=(
         "命名空间内的显示名防仿冒：NFKC+casefold 规范名查重、"
         "confusables 同形字符判定；混脚本拦截支持命名空间级策略"
@@ -95,6 +97,10 @@ app = FastAPI(
         "有效预占与释放冷却为约束寻找互不冲突组合，存在多组解时取候选序号"
         "向量字典序最小解并一次性注册，无可行组合返回 409 allocation_impossible"
         "（附逐候选阻断原因、不写部分结果），搜索状态超过 10000 返回 413 且不写库。"
+        "全部 display_names 行变更由数据库审计触发器在同事务内逐次记录到 "
+        "name_events（注册、预占确认、改名、交换、命名空间合并与释放；回滚不留"
+        "事件），GET /name-events 按事件号升序提供 after_id 排他游标分页"
+        "（limit 1–100），并可按 namespace（匹配变更前或后空间）过滤。"
     ),
     lifespan=lifespan,
 )
@@ -842,6 +848,40 @@ def check_name(namespace: str, payload: NameRequest, conn=Depends(get_db)) -> di
 )
 def list_names(namespace: str, conn=Depends(get_db)) -> list[dict]:
     return service.list_names(conn, namespace)
+
+
+@app.get(
+    "/name-events",
+    response_model=NameEventsResponse,
+    responses={
+        422: {"description": "limit 超出 1–100 范围、after_id 为负，或 namespace 为空白"},
+    },
+)
+def list_name_events(
+    namespace: str | None = Query(default=None, min_length=1, max_length=64),
+    after_id: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=100),
+    conn=Depends(get_db),
+) -> dict:
+    """显示名变更流水：display_names 行级变更的审计事件，按事件号升序分页。
+
+    事件由数据库审计触发器在业务事务内逐次写入（注册、预占确认 -> insert；
+    改名、交换、命名空间合并 -> update；释放 -> delete），与业务数据同生共死：
+    业务事务回滚时事件一并回滚，不会留下孤儿事件。每条事件含事件号（自增
+    id）、UTC 时刻（occurred_at）、动作（action）与变更前后两侧的 id /
+    namespace / original_name / normalized_name / revision（insert 无
+    old_*，delete 无 new_*）；交换的临时名中间步骤也逐次记录。迁移只建立
+    表与触发器，**不为存量数据补造历史事件**。
+
+    分页：`after_id` 为排他游标（只返回事件号大于它的事件，默认 0 即从头
+    开始），`limit` 为单页条数（1–100，默认 100）；响应的 `next_cursor`
+    为本页最后一条事件号（作为下一次的 `after_id`），为 `null` 表示没有
+    更多事件。`namespace` 过滤匹配变更前**或**变更后的命名空间：合并迁出
+    源空间、迁入目标空间的 update 事件在两侧都能查到。
+    """
+    return service.list_name_events(
+        conn, namespace=namespace, after_id=after_id, limit=limit
+    )
 
 
 @app.get(
